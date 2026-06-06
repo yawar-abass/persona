@@ -1,5 +1,5 @@
 import json
-from fastapi import APIRouter, Request,Header, HTTPException
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from groq import Groq
 from app.config import settings
@@ -10,7 +10,6 @@ from app.services.cal_service import cal_service
 from datetime import datetime
 import pytz
 from loguru import logger
-
 
 router = APIRouter()
 groq_client = Groq(api_key=settings.GROQ_API_KEY)
@@ -41,13 +40,14 @@ BOOKING_TOOL = {
         }
     }
 }
+
 SECRET_ROUTE = settings.VAPI_SECRET
 
 @router.post(f"/{SECRET_ROUTE}/chat/completions")
 async def chat_completions(request: Request):
-  
     payload = await request.json()
     raw_messages = payload.get("messages", [])
+
     # 1. Sanitize incoming messages
     clean_messages = []
     for msg in raw_messages:
@@ -59,6 +59,7 @@ async def chat_completions(request: Request):
 
     # 2. Extract and validate the latest user message SAFELY
     user_query = ""
+    safe_query = ""
     for i in range(len(clean_messages) - 1, -1, -1):
         if clean_messages[i].get("role") == "user":
             user_query = clean_messages[i].get("content", "")
@@ -80,12 +81,13 @@ async def chat_completions(request: Request):
         while clean_messages and "tool_calls" in clean_messages[0]:
             clean_messages.pop(0)
 
-   # 4. Latency Guard: Only run RAG if they are asking about technical skills or background
+    # 4. Latency Guard: Only run RAG if they are asking about technical skills or background
     rag_context = ""
-    keywords = ["project", "experience", "iit", "collabnotes", "tech", "stack", "architecture", "kotlin", "android", "ai", "ml", "research","education","background","skills"]
+    keywords = ["project", "experience", "iit", "collabnotes", "tech", "stack", "architecture", "kotlin", "android", "ai", "ml", "research", "education", "background", "skills"]
     if any(word in safe_query.lower() for word in keywords) and len(safe_query.split()) > 2:
         logger.debug(f"🔍 Running context retrieval for query: {safe_query}")
         rag_context = rag_service.retrieve_context(safe_query)
+
     # 5. Build current conversation context
     current_system_prompt = SYSTEM_PROMPT
     if rag_context:
@@ -97,9 +99,10 @@ async def chat_completions(request: Request):
 
     # 6. Assemble the Final Safe Array
     final_messages = [{"role": "system", "content": current_system_prompt}]
-    final_messages.extend(clean_messages) # Use the safe array, DO NOT slice [-6:] here!
+    final_messages.extend(clean_messages) 
+
     try:
-    # 7. Query Groq for initial tool-call check
+        # 7. Query Groq for initial tool-call check
         initial_response = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=final_messages,
@@ -108,16 +111,17 @@ async def chat_completions(request: Request):
             temperature=0.1
         )
     except Exception as e:
-        # Prevent server crash and smoothly inform the user
+        logger.error(f"🚨 Initial Groq Error: {e}")
         def error_stream():
-            yield f'data: {json.dumps({"choices": [{"delta": {"content": "Ah, apologies, my neural link is experiencing a bit of latency right now. Could you repeat that?"}}]})}\n\n'
+            # EXACT strict JSON format required by Vapi to prevent hang-ups
+            yield f'data: {json.dumps({"id": "err-1", "choices": [{"delta": {"content": "Ah, apologies, my neural link is experiencing a bit of latency right now. Could you repeat that?"}}]})}\n\n'
             yield 'data: [DONE]\n\n'
         return StreamingResponse(error_stream(), media_type="text/event-stream")
     
     response_message = initial_response.choices[0].message
     tool_calls = response_message.tool_calls
 
-   # 5. If the model determines a tool call is required, execute it natively
+    # 8. THE TOOL EXECUTION BLOCK
     if tool_calls:
         logger.warning(f"🛠️ Tool execution triggered: {tool_calls[0].function.name}")
         
@@ -143,20 +147,32 @@ async def chat_completions(request: Request):
                 }
                 final_messages.append(assistant_tool_message)
                 
-                # --- 3. Execute the tool safely ---
+                # --- 3. Execute the tool safely (The Bouncer) ---
                 for tool_call in tool_calls:
                     if tool_call.function.name == "book_calendar_interview":
-                        # Safely parse arguments to prevent crashes if the LLM hallucinates
                         try:
                             arguments = json.loads(tool_call.function.arguments)
                         except json.JSONDecodeError:
                             arguments = {}
                         
-                        booking_result = await cal_service.book_interview(
-                            name=arguments.get("name", ""),
-                            email=arguments.get("email", ""),
-                            start_time=arguments.get("start_time", "")
-                        )
+                        email = arguments.get("email", "")
+                        name = arguments.get("name", "")
+                        start_time = arguments.get("start_time", "")
+
+                        # THE BOUNCER: Reject the LLM if it tries to book without the required data
+                        if not email or not name or not start_time:
+                            logger.warning(f"⚠️ LLM tried to book without all data. Args: {arguments}")
+                            booking_result = {
+                                "success": False, 
+                                "message": "SYSTEM ERROR: You cannot book the meeting yet. You must politely ask the user for their missing information (name, email, or time) first."
+                            }
+                        else:
+                            # Proceed with real booking
+                            booking_result = await cal_service.book_interview(
+                                name=name,
+                                email=email,
+                                start_time=start_time
+                            )
                         
                         final_messages.append({
                             "role": "tool",
@@ -170,7 +186,7 @@ async def chat_completions(request: Request):
                     model="llama-3.1-8b-instant",
                     messages=final_messages,
                     temperature=0.3,
-                    stream=True # Streaming correctly this time
+                    stream=True
                 )
                 
                 for chunk in final_response_stream:
@@ -184,7 +200,7 @@ async def chat_completions(request: Request):
                 yield "data: [DONE]\n\n"
             
             except Exception as e:
-                # --- 5. THE SAFETY NET (Prevents Vapi from hanging up on errors) ---
+                # --- 5. THE SAFETY NET ---
                 logger.error(f"🚨 Tool execution failed: {e}")
                 error_recovery_msg = "Sorry about that, my calendar integration just had a quick hiccup. What were we saying?"
                 yield f"data: {json.dumps({'id': 'error-1', 'choices': [{'delta': {'content': error_recovery_msg}}]})}\n\n"
@@ -192,7 +208,7 @@ async def chat_completions(request: Request):
 
         return StreamingResponse(execute_and_stream_final(), media_type="text/event-stream")
 
-    # 6. If no tool was called, fallback to streaming the standard conversational response instantly
+    # 9. STANDARD CONVERSATION BLOCK (No tools called)
     def generate_stream():
         try:
             stream_response = groq_client.chat.completions.create(
@@ -211,6 +227,9 @@ async def chat_completions(request: Request):
                     yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            logger.error(f"🚨 Conversational Stream Error: {e}")
+            # Safe fallback text to prevent hang-ups
+            yield f"data: {json.dumps({'id': 'err-3', 'choices': [{'delta': {'content': 'My apologies, I missed that. Could you repeat it?'}}]})}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
