@@ -1,8 +1,7 @@
 import json
-import asyncio
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
-from groq import Groq, RateLimitError, APIError
+from groq import Groq
 from app.config import settings
 from app.core.persona import SYSTEM_PROMPT
 from app.core.security import clean_and_validate_input
@@ -17,7 +16,7 @@ import re
 router = APIRouter()
 groq_client = Groq(api_key=settings.GROQ_API_KEY)
 
-
+# Define the production tool schema for Groq function calling
 BOOKING_TOOL = {
     "type": "function",
     "function": {
@@ -26,12 +25,18 @@ BOOKING_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The full name of the recruiter, interviewer, or evaluator."},
-                "email": {
-                    "type": "string", 
-                    "description": "The valid email address of the attendee. CRITICAL: You must resolve phonetic spellings and stutters before outputting. Convert 'zero' to '0', fix double words ('at at' to '@'), and remove spaces."
+                "name": {
+                    "type": "string",
+                    "description": "The full name of the recruiter, interviewer, or evaluator."
                 },
-                "start_time": {"type": "string", "description": "The exact ISO 8601 UTC date-time string for the slot."}
+                "email": {
+                    "type": "string",
+                    "description": "The valid email address of the attendee where the calendar invite will be sent."
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "The exact ISO 8601 UTC date-time string for the slot (e.g., '2026-06-15T10:00:00Z'). Ensure the year matches 2026."
+                }
             },
             "required": ["name", "email", "start_time"]
         }
@@ -124,7 +129,7 @@ async def chat_completions(request: Request):
         if "name" in msg: clean_msg["name"] = msg["name"]
         clean_messages.append(clean_msg)
 
-    # 2. Extract and validate user message
+    # 2. Extract and validate the latest user message SAFELY
     user_query = ""
     safe_query = ""
     for i in range(len(clean_messages) - 1, -1, -1):
@@ -135,8 +140,8 @@ async def chat_completions(request: Request):
                 clean_messages[i]["content"] = safe_query
             break
 
-    # 3. Sliding Window Context
-    MAX_HISTORY = 12
+    # 3. PRODUCTION FIX: Sliding Window Context
+    MAX_HISTORY = 10
     if len(clean_messages) > MAX_HISTORY:
         # Slice from the end to keep the most recent messages
         cutoff_index = len(clean_messages) - MAX_HISTORY
@@ -181,56 +186,31 @@ async def chat_completions(request: Request):
     final_messages = [{"role": "system", "content": current_system_prompt}]
     final_messages.extend(clean_messages) 
 
-    # 6. THE UNIFIED, FAULT-TOLERANT STREAMING GENERATOR
+    # 6. THE UNIFIED STREAMING GENERATOR
     async def unified_streaming_generator():
-        stream_response = None
-        max_retries = 2
-        
-        # --- API RETRY LOOP FOR INITIAL REQUEST ---
-        for attempt in range(max_retries):
-            try:
-                stream_response = groq_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=final_messages,
-                    tools=[BOOKING_TOOL,CHECK_AVAILABILITY_TOOL],
-                    tool_choice="auto",
-                    temperature=0.2,
-                    stream=True
-                )
-                break # Success! Break out of the retry loop.
-                
-            except RateLimitError as e:
-                logger.warning(f"⚠️ Groq Rate Limit Hit (Attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    # Yield a filler phrase so the user knows we are waiting, then pause the code.
-                    yield f"data: {json.dumps({'id': 'rate-limit-wait', 'choices': [{'delta': {'content': 'The network is a bit crowded, just give me one second... '}}]})}\n\n"
-                    await asyncio.sleep(1.5) # Wait for token bucket to refill
-                else:
-                    logger.error("🚨 Groq Rate Limit Exhausted.")
-                    yield f"data: {json.dumps({'id': 'rate-limit-fail', 'choices': [{'delta': {'content': 'My systems are completely overwhelmed with traffic right now. Could we try again in a few minutes?'}}]})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-            except APIError as e:
-                logger.error(f"🚨 Groq API Error: {e}")
-                yield f"data: {json.dumps({'id': 'api-fail', 'choices': [{'delta': {'content': 'I am having trouble connecting to my central node. Please repeat that.'}}]})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-        if not stream_response:
-            return
-
         try:
+            stream_response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=final_messages,
+                tools=[BOOKING_TOOL],
+                tool_choice="auto",
+                temperature=0.2,
+                stream=True
+            )
+
             tool_calls_accumulators = {}
             is_tool_call = False
             has_yielded_filler = False
 
-            # Iterate through chunks
+            # Iterate through the chunks as they arrive in milliseconds
             for chunk in stream_response:
                 delta = chunk.choices[0].delta
 
-                # PATH A: GROQ IS CALLING A TOOL
+                # --- PATH A: GROQ IS CALLING A TOOL ---
                 if delta.tool_calls:
                     is_tool_call = True
+                    
+                    # IMMEDIATELY yield the filler phrase to satisfy Vapi's timeout
                     if not has_yielded_filler:
                         try:
                             # Yield ONLY standard text content so Vapi can speak it. 
@@ -243,25 +223,33 @@ async def chat_completions(request: Request):
                     for tc in delta.tool_calls:
                         index = tc.index
                         if index not in tool_calls_accumulators:
-                            tool_calls_accumulators[index] = {"id": tc.id, "name": tc.function.name if tc.function else "book_calendar_interview", "arguments": ""}
+                            tool_calls_accumulators[index] = {
+                                "id": tc.id,
+                                "name": tc.function.name if tc.function else "book_calendar_interview",
+                                "arguments": ""
+                            }
                         if tc.function and tc.function.arguments:
                             tool_calls_accumulators[index]["arguments"] += tc.function.arguments
                     continue 
 
-                # PATH B: GROQ IS JUST TALKING
+                # --- PATH B: GROQ IS JUST TALKING (Instant Stream) ---
                 if delta.content and not is_tool_call:
-                    try:
-                        yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': delta.content}}]})}\n\n"
-                    except Exception:
-                        break # Handle user interruption gracefully
-            # --- EXECUTE THE TOOL ---
+                    yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': delta.content}}]})}\n\n"
+
+            # --- EXECUTE THE TOOL (Only triggers if Path A happened) ---
             if is_tool_call:
+                # Reconstruct the tool call object
                 formatted_tool_calls = []
                 for tc in tool_calls_accumulators.values():
-                    formatted_tool_calls.append({"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}})
+                    formatted_tool_calls.append({
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]}
+                    })
 
                 final_messages.append({"role": "assistant", "tool_calls": formatted_tool_calls})
 
+                # Execute with The Bouncer
                 for tc in formatted_tool_calls:
                     if tc["function"]["name"] == "book_calendar_interview":
                         try:
@@ -325,58 +313,23 @@ async def chat_completions(request: Request):
                             "name": "book_calendar_interview",
                             "content": json.dumps(booking_result)
                         })
-                    
-                    elif tc["function"]["name"] == "check_calendar_availability":
-                        try:
-                            arguments = json.loads(tc["function"]["arguments"])
-                        except Exception:
-                            arguments = {}
 
-                        date_to_check = arguments.get("date", "")
-                        
-                        if not date_to_check:
-                            availability_result = {"success": False, "message": "SYSTEM ERROR: You must provide a specific date (YYYY-MM-DD) to check availability."}
-                        else:
-                            availability_result = await cal_service.check_availability(date=date_to_check)
-
-                        final_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "name": "check_calendar_availability",
-                            "content": json.dumps(availability_result)
-                        })
-                # --- API RETRY LOOP FOR TOOL RESULT STREAM ---
-                tool_result_stream = None
-                for attempt in range(max_retries):
-                    try:
-                        tool_result_stream = groq_client.chat.completions.create(
-                            model="llama-3.1-8b-instant",
-                            messages=final_messages,
-                            temperature=0.3,
-                            stream=True
-                        )
-                        break
-                    except RateLimitError:
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(1.0)
-                        else:
-                            yield f"data: {json.dumps({'id': 'rate-limit-tool', 'choices': [{'delta': {'content': 'The calendar synced, but my voice module is rate limited. We are good to go.'}}]})}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-
-                if tool_result_stream:
-                    for chunk in tool_result_stream:
-                        if chunk.choices[0].delta.content is not None:
-                            try:
-                                yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': chunk.choices[0].delta.content}}]})}\n\n"
-                            except Exception:
-                                break # Handle user interruption gracefully
+                # Stream the final post-tool result
+                tool_result_stream = groq_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=final_messages,
+                    temperature=0.3,
+                    stream=True
+                )
+                for chunk in tool_result_stream:
+                    if chunk.choices[0].delta.content is not None:
+                        yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': chunk.choices[0].delta.content}}]})}\n\n"
 
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"🚨 Stream Generation Error: {e}")
-            yield f"data: {json.dumps({'id': 'err-stream', 'choices': [{'delta': {'content': 'My apologies, I had a brief connection issue. Could you repeat that?'}}]})}\n\n"
+            logger.error(f"🚨 Stream Error: {e}")
+            yield f"data: {json.dumps({'id': 'err', 'choices': [{'delta': {'content': 'My apologies, I had a brief connection issue. Could you repeat that?'}}]})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(unified_streaming_generator(), media_type="text/event-stream")
