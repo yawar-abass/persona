@@ -117,64 +117,80 @@ async def chat_completions(request: Request):
     response_message = initial_response.choices[0].message
     tool_calls = response_message.tool_calls
 
-    # 5. If the model determines a tool call is required, execute it natively
+   # 5. If the model determines a tool call is required, execute it natively
     if tool_calls:
-        assistant_tool_message = {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": tool.id,
-                    "type": "function",
-                    "function": {
-                        "name": tool.function.name,
-                        "arguments": tool.function.arguments
-                    }
-                } for tool in tool_calls
-            ]
-        }
-        final_messages.append(assistant_tool_message)
-        for tool_call in tool_calls:
-            if tool_call.function.name == "book_calendar_interview":
-                # Natively extract the parameters determined by the model
-                arguments = json.loads(tool_call.function.arguments)
+        logger.warning(f"🛠️ Tool execution triggered: {tool_calls[0].function.name}")
+        
+        async def execute_and_stream_final():
+            try:
+                # --- 1. THE FILLER PHRASE (Prevents timeout hang-ups) ---
+                filler_text = "Got it. Give me just a second to check the calendar..."
+                yield f"data: {json.dumps({'id': 'filler-1', 'choices': [{'delta': {'content': filler_text}}]})}\n\n"
+
+                # --- 2. Add the tool intent to history ---
+                assistant_tool_message = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": tool.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool.function.name,
+                                "arguments": tool.function.arguments
+                            }
+                        } for tool in tool_calls
+                    ]
+                }
+                final_messages.append(assistant_tool_message)
                 
-                # Execute the real external Cal.com V2 endpoint
-                booking_result = await cal_service.book_interview(
-                    name=arguments.get("name"),
-                    email=arguments.get("email"),
-                    start_time=arguments.get("start_time")
-                )
+                # --- 3. Execute the tool safely ---
+                for tool_call in tool_calls:
+                    if tool_call.function.name == "book_calendar_interview":
+                        # Safely parse arguments to prevent crashes if the LLM hallucinates
+                        try:
+                            arguments = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        
+                        booking_result = await cal_service.book_interview(
+                            name=arguments.get("name", ""),
+                            email=arguments.get("email", ""),
+                            start_time=arguments.get("start_time", "")
+                        )
+                        
+                        final_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": "book_calendar_interview",
+                            "content": json.dumps(booking_result)
+                        })
                 
-                # Feed the real-world operational result back into the system message chain
-                # final_messages.append(response_message)
-                final_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": "book_calendar_interview",
-                    "content": json.dumps(booking_result)
-                })
-                
-                # Request a final response from Groq based strictly on the execution output
-                final_response = groq_client.chat.completions.create(
+                # --- 4. Stream the final response safely ---
+                final_response_stream = groq_client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=final_messages,
                     temperature=0.3,
-                    stream=True
+                    stream=True # Streaming correctly this time
                 )
                 
-                # Simple generator to wrap the final text as an OpenAI-compatible stream
-                def stream_text_response(text: str):
-                    data = json.dumps({
-                        "id": "chatcmpl-tool",
-                        "choices": [{"delta": {"content": text}}]
-                    })
-                    yield f"data: {data}\n\n"
-                    yield "data: [DONE]\n\n"
-                    
-                return StreamingResponse(
-                    stream_text_response(final_response.choices[0].message.content), 
-                    media_type="text/event-stream"
-                )
+                for chunk in final_response_stream:
+                    if chunk.choices[0].delta.content is not None:
+                        data = json.dumps({
+                            "id": chunk.id,
+                            "choices": [{"delta": {"content": chunk.choices[0].delta.content}}]
+                        })
+                        yield f"data: {data}\n\n"
+                        
+                yield "data: [DONE]\n\n"
+            
+            except Exception as e:
+                # --- 5. THE SAFETY NET (Prevents Vapi from hanging up on errors) ---
+                logger.error(f"🚨 Tool execution failed: {e}")
+                error_recovery_msg = "Sorry about that, my calendar integration just had a quick hiccup. What were we saying?"
+                yield f"data: {json.dumps({'id': 'error-1', 'choices': [{'delta': {'content': error_recovery_msg}}]})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(execute_and_stream_final(), media_type="text/event-stream")
 
     # 6. If no tool was called, fallback to streaming the standard conversational response instantly
     def generate_stream():
