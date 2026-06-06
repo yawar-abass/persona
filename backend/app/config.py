@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     PINECONE_API_KEY: str
     GEMINI_API_KEY: str
     CAL_API_KEY: str
-    VAPI_SECRET: str = os.getenv("VAPI_SECRET", "my_super_secure_scaler_secret_123")
+    VAPI_SECRET: str 
     # App Configs
     PINECONE_INDEX_NAME: str = "scaler-rag"
     CAL_EVENT_TYPE_ID: str = ""  # Populated via Cal.com event dashboard

@@ -42,7 +42,7 @@ export default function ChatPage() {
     try {
       // 2. Initiate Native Fetch request to FastAPI
       const response = await fetch(
-        `https://persona-g83y.onrender.com/api/${process.env.VAPI_SECRET}/chat/completions`,
+        `http://localhost:8000/api/miq5iUqL/chat/completions`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

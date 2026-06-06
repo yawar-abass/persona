@@ -17,6 +17,7 @@ import re
 router = APIRouter()
 groq_client = Groq(api_key=settings.GROQ_API_KEY)
 
+
 BOOKING_TOOL = {
     "type": "function",
     "function": {
@@ -26,7 +27,10 @@ BOOKING_TOOL = {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "The full name of the recruiter, interviewer, or evaluator."},
-                "email": {"type": "string", "description": "The valid email address of the attendee."},
+                "email": {
+                    "type": "string", 
+                    "description": "The valid email address of the attendee. CRITICAL: You must resolve phonetic spellings and stutters before outputting. Convert 'zero' to '0', fix double words ('at at' to '@'), and remove spaces."
+                },
                 "start_time": {"type": "string", "description": "The exact ISO 8601 UTC date-time string for the slot."}
             },
             "required": ["name", "email", "start_time"]
@@ -57,12 +61,22 @@ CHECK_AVAILABILITY_TOOL = {
 SECRET_ROUTE = settings.VAPI_SECRET
 
 def sanitize_and_validate_email(spoken_email: str) -> dict:
-    """Cleans up voice transcription errors for emails and validates the format."""
+    """Cleans up voice transcription errors, stutters, and spelled-out numbers for emails."""
     if not spoken_email:
         return {"is_valid": False, "clean_email": ""}
         
-    # 1. Lowercase and handle common voice-to-text misinterpretations
     clean_email = spoken_email.lower().strip()
+    
+    # 1. Convert spelled-out numbers to digits
+    number_words = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", 
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+    }
+    for word, digit in number_words.items():
+        # Use regex to only replace whole words (so we don't accidentally replace 't' in 'two')
+        clean_email = re.sub(rf'\b{word}\b', digit, clean_email)
+        
+    # 2. Text to symbol replacements
     replacements = {
         " at rate ": "@",
         " at ": "@",
@@ -71,16 +85,29 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
         " dot ": ".",
         " [dot] ": ".",
         "(dot)": ".",
-        " ": ""  # Strip all accidental spaces left by the transcriber
     }
-    
     for old, new in replacements.items():
         clean_email = clean_email.replace(old, new)
         
-    # 2. Regex validation to ensure it looks like a real email
+    # 3. Strip all spaces
+    clean_email = clean_email.replace(" ", "")
+    
+    # 4. Clean up Transcriber Stuttering (The "at at" and "gmail gmail" problem)
+    clean_email = re.sub(r'@+', '@', clean_email)  # Collapse multiple @@@ into one @
+    clean_email = re.sub(r'\.+', '.', clean_email)  # Collapse multiple ... into one .
+    clean_email = clean_email.replace("gmailgmail", "gmail")
+    clean_email = clean_email.replace("yahooyahoo", "yahoo")
+    
+    # 5. Strip trailing periods (added by transcriber at the end of sentences)
+    clean_email = clean_email.rstrip('.')
+    
+    # 6. Regex validation
     email_regex = r"^[\w\.-]+@[\w\.-]+\.\w+$"
     is_valid = bool(re.match(email_regex, clean_email))
     
+    if not is_valid:
+        logger.warning(f"Email sanitation failed. Raw: '{spoken_email}' -> Cleaned: '{clean_email}'")
+        
     return {"is_valid": is_valid, "clean_email": clean_email}
 
 @router.post(f"/{SECRET_ROUTE}/chat/completions")
@@ -135,7 +162,9 @@ async def chat_completions(request: Request):
 
     filler_phrases = {"hello", "hi", "hey", "yes", "no", "yeah", "nope", "okay", "ok", "thanks", "thank you", "cool", "got it", "awesome", "sure", "right"}
 
-    if clean_normalized and clean_normalized not in filler_phrases:
+    is_personal_info = any(indicator in normalized_query for indicator in ["@", "dot com", "gmail", "yahoo", "my name is", "i am", "email"])
+
+    if clean_normalized and clean_normalized not in filler_phrases and not is_personal_info:
         logger.debug(f"🔍 Running Semantic RAG for: {safe_query}")
         # Bumping top_k to 4 to ensure we catch deep README details
         rag_context = rag_service.retrieve_context(safe_query, top_k=4)
@@ -203,15 +232,12 @@ async def chat_completions(request: Request):
                 if delta.tool_calls:
                     is_tool_call = True
                     if not has_yielded_filler:
-                        # 1. Voice Fallback: Yield the filler phrase for the audio stream
-                        yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Give me just a second...'}}]})}\n\n"
-                        
-                        # 2. UI Signal: Yield a custom tool-pending state for your web chat
-                        ui_signal = {
-                            "id": "tool-exec",
-                            "choices": [{"delta": {"tool_calls": [{"function": {"name": "system_action", "arguments": "{}"}}]}}]
-                        }
-                        yield f"data: {json.dumps(ui_signal)}\n\n"
+                        try:
+                            # Yield ONLY standard text content so Vapi can speak it. 
+                            # Do NOT yield fake tool_calls, it crashes the Vapi parser.
+                            yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Give me just a second to pull that up...'}}]})}\n\n"
+                        except Exception:
+                            break # Handle user interruption gracefully
                         has_yielded_filler = True
 
                     for tc in delta.tool_calls:
@@ -224,8 +250,10 @@ async def chat_completions(request: Request):
 
                 # PATH B: GROQ IS JUST TALKING
                 if delta.content and not is_tool_call:
-                    yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': delta.content}}]})}\n\n"
-
+                    try:
+                        yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': delta.content}}]})}\n\n"
+                    except Exception:
+                        break # Handle user interruption gracefully
             # --- EXECUTE THE TOOL ---
             if is_tool_call:
                 formatted_tool_calls = []
@@ -247,15 +275,29 @@ async def chat_completions(request: Request):
 
                         email_data = sanitize_and_validate_email(raw_email)
                         current_dt = datetime.now(ist_tz)
+                        start_time = ""
+
+                        # --- BULLETPROOF DATE PARSING ---
                         if "tomorrow" in raw_start_time.lower():
                             target_dt = current_dt + timedelta(days=1)
-                            # Default to 10:00 AM if no specific time was caught
                             start_time = target_dt.replace(hour=10, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
                         elif "today" in raw_start_time.lower():
                             start_time = current_dt.replace(hour=17, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
                         else:
-                            # Assume the LLM formatted it correctly, but ensure 'Z' UTC compliance for Cal.com
-                            start_time = raw_start_time if raw_start_time.endswith("Z") else f"{raw_start_time}Z"
+                            # Use Regex to extract exactly YYYY-MM-DDTHH:MM:SS, ignoring any trailing garbage
+                            iso_pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                            match = re.search(iso_pattern, raw_start_time)
+                            
+                            if match:
+                                # Force the 'Z' on the cleanly extracted string
+                                start_time = f"{match.group(0)}Z"
+                            else:
+                                # If the LLM passed something completely unreadable (e.g., "10 AM"), 
+                                # leave start_time empty so the validation block catches it.
+                                logger.error(f"❌ Unparseable ISO string from LLM: {raw_start_time}")
+                                start_time = ""
+
+
                         validation_errors = []
                         if not raw_name or len(raw_name) < 2:
                             validation_errors.append("a valid full name")
@@ -325,7 +367,10 @@ async def chat_completions(request: Request):
                 if tool_result_stream:
                     for chunk in tool_result_stream:
                         if chunk.choices[0].delta.content is not None:
-                            yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': chunk.choices[0].delta.content}}]})}\n\n"
+                            try:
+                                yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': chunk.choices[0].delta.content}}]})}\n\n"
+                            except Exception:
+                                break # Handle user interruption gracefully
 
             yield "data: [DONE]\n\n"
 
