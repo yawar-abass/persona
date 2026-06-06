@@ -75,6 +75,45 @@ class CalService:
         except Exception as e:
             print(f"Unexpected error in booking workflow: {e}")
             return {"success": False, "message": str(e)}
+    
+    async def check_availability(self, date: str) -> dict:
+        """
+        Checks Cal.com for available time slots on a specific date.
+        Args:
+            date: YYYY-MM-DD string (e.g., '2026-06-15')
+        """
+        if not settings.CAL_API_KEY:
+            return {"success": False, "message": "API key missing."}
 
+        # Cal.com v2 slots endpoint
+        url = f"{self.base_url}/slots"
+        event_id = int(settings.CAL_EVENT_TYPE_ID) if settings.CAL_EVENT_TYPE_ID.isdigit() else 123456
+
+        # Look for slots from the start of the requested day to the end
+        params = {
+            "eventTypeId": event_id,
+            "startTime": f"{date}T00:00:00Z",
+            "endTime": f"{date}T23:59:59Z",
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, params=params, headers=self.headers, timeout=5.0)
+            
+            if response.status_code == 200:
+                data = response.json()
+                slots = data.get("data", {}).get("slots", [])
+                
+                if not slots:
+                    return {"success": True, "available_slots": [], "message": "No slots available on this date."}
+                
+                # Extract just the raw times to keep the LLM context clean
+                available_times = [slot.get("time") for slot in slots]
+                return {"success": True, "available_slots": available_times}
+            else:
+                return {"success": False, "message": "Could not fetch calendar availability."}
+                
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 # Export single functional service instance
 cal_service = CalService()
