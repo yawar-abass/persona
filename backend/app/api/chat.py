@@ -11,6 +11,8 @@ from app.services.cal_service import cal_service
 from datetime import datetime
 import pytz
 from loguru import logger
+import re
+
 
 router = APIRouter()
 groq_client = Groq(api_key=settings.GROQ_API_KEY)
@@ -32,7 +34,54 @@ BOOKING_TOOL = {
     }
 }
 
+
+CHECK_AVAILABILITY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "check_calendar_availability",
+        "description": "Checks the user's real calendar for open, available time slots on a specific date. Use this BEFORE attempting to book a meeting so you can propose real times to the caller.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "The exact date to check for open slots in YYYY-MM-DD format (e.g., '2026-06-15'). Ensure the year is 2026."
+                }
+            },
+            "required": ["date"]
+        }
+    }
+}
+
+
 SECRET_ROUTE = settings.VAPI_SECRET
+
+def sanitize_and_validate_email(spoken_email: str) -> dict:
+    """Cleans up voice transcription errors for emails and validates the format."""
+    if not spoken_email:
+        return {"is_valid": False, "clean_email": ""}
+        
+    # 1. Lowercase and handle common voice-to-text misinterpretations
+    clean_email = spoken_email.lower().strip()
+    replacements = {
+        " at rate ": "@",
+        " at ": "@",
+        " [at] ": "@",
+        "(at)": "@",
+        " dot ": ".",
+        " [dot] ": ".",
+        "(dot)": ".",
+        " ": ""  # Strip all accidental spaces left by the transcriber
+    }
+    
+    for old, new in replacements.items():
+        clean_email = clean_email.replace(old, new)
+        
+    # 2. Regex validation to ensure it looks like a real email
+    email_regex = r"^[\w\.-]+@[\w\.-]+\.\w+$"
+    is_valid = bool(re.match(email_regex, clean_email))
+    
+    return {"is_valid": is_valid, "clean_email": clean_email}
 
 @router.post(f"/{SECRET_ROUTE}/chat/completions")
 async def chat_completions(request: Request):
@@ -98,7 +147,7 @@ async def chat_completions(request: Request):
                 stream_response = groq_client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=final_messages,
-                    tools=[BOOKING_TOOL],
+                    tools=[BOOKING_TOOL,CHECK_AVAILABILITY_TOOL],
                     tool_choice="auto",
                     temperature=0.2,
                     stream=True
@@ -168,15 +217,32 @@ async def chat_completions(request: Request):
                         except Exception:
                             arguments = {}
 
-                        email = arguments.get("email", "")
-                        name = arguments.get("name", "")
-                        start_time = arguments.get("start_time", "")
+                        raw_email = arguments.get("email", "")
+                        raw_name = arguments.get("name", "").strip()
+                        start_time = arguments.get("start_time", "").strip()
 
-                        if not email or not name or not start_time:
-                            logger.warning("⚠️ LLM tried to book without all data.")
-                            booking_result = {"success": False, "message": "SYSTEM ERROR: You cannot book yet. Politely ask the user for their missing info."}
+                        email_data = sanitize_and_validate_email(raw_email)
+                        
+                        validation_errors = []
+                        if not raw_name or len(raw_name) < 2:
+                            validation_errors.append("a valid full name")
+                        if not email_data["is_valid"]:
+                            validation_errors.append("a valid email address")
+                        if not start_time:
+                            validation_errors.append("a specific time for the meeting")
+
+                        if validation_errors:
+                            logger.warning(f"⚠️ Validation Failed: {validation_errors}. Raw Email: {raw_email}")
+                            issues_str = " and ".join(validation_errors)
+                            error_prompt = f"SYSTEM ERROR: You cannot book yet. The provided data is invalid. Politely ask the user to clarify: {issues_str}. Note: The email you heard was '{raw_email}' which is invalid."
+                            
+                            booking_result = {"success": False, "message": error_prompt}
                         else:
-                            booking_result = await cal_service.book_interview(name=name, email=email, start_time=start_time)
+                            booking_result = await cal_service.book_interview(
+                                name=raw_name, 
+                                email=email_data["clean_email"], 
+                                start_time=start_time
+                            )
 
                         final_messages.append({
                             "role": "tool",
@@ -184,7 +250,26 @@ async def chat_completions(request: Request):
                             "name": "book_calendar_interview",
                             "content": json.dumps(booking_result)
                         })
+                    
+                    elif tc["function"]["name"] == "check_calendar_availability":
+                        try:
+                            arguments = json.loads(tc["function"]["arguments"])
+                        except Exception:
+                            arguments = {}
 
+                        date_to_check = arguments.get("date", "")
+                        
+                        if not date_to_check:
+                            availability_result = {"success": False, "message": "SYSTEM ERROR: You must provide a specific date (YYYY-MM-DD) to check availability."}
+                        else:
+                            availability_result = await cal_service.check_availability(date=date_to_check)
+
+                        final_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": "check_calendar_availability",
+                            "content": json.dumps(availability_result)
+                        })
                 # --- API RETRY LOOP FOR TOOL RESULT STREAM ---
                 tool_result_stream = None
                 for attempt in range(max_retries):
