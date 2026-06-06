@@ -41,14 +41,15 @@ export default function ChatPage() {
 
     try {
       // 2. Initiate Native Fetch request to FastAPI
-      const response = await fetch(
-        `http://localhost:8000/api/miq5iUqL/chat/completions`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: newMessages }),
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      );
+        body: JSON.stringify({
+          messages: newMessages,
+        }),
+      });
 
       if (!response.ok)
         throw new Error(`HTTP error! status: ${response.status}`);
