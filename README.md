@@ -1,88 +1,59 @@
 # 🎙️ Voice AI Interview Agent
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.11+-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/FastAPI-0.100+-00a393.svg" alt="FastAPI">
-  <img src="https://img.shields.io/badge/Next.js-14+-black.svg" alt="Next.js">
-  <img src="https://img.shields.io/badge/LLM-Groq_Llama_3.1-f55036.svg" alt="Groq">
-  <img src="https://img.shields.io/badge/Voice-Vapi-purple.svg" alt="Vapi">
-</p>
-
-<p align="center">
-  <strong>Production-ready Voice AI Agent for conducting technical interviews and scheduling meetings in real time.</strong>
-</p>
+> **Production-ready Voice AI Agent for conducting technical interviews and scheduling meetings in real time.**
 
 ---
 
 ## 🚀 Overview
 
-Voice AI Interview Agent is a low-latency, production-ready AI system designed to conduct technical phone screens, answer candidate questions, and schedule interviews automatically.
+The Voice AI Interview Agent is a low-latency, production-ready AI system designed to conduct technical phone screens, answer candidate questions, and schedule interviews automatically.
 
-The project combines a **FastAPI backend** for agent orchestration and tool execution with a **Next.js frontend** that acts as a secure Backend-for-Frontend (BFF).
+The project combines a **FastAPI** backend for agent orchestration and tool execution with a **Next.js** frontend that acts as a secure Backend-for-Frontend (BFF).
 
 Built as a technical demonstration for an AI Engineer role, the system showcases:
 
-- Real-time voice conversations
+- Real-time conversational voice agents
 - Tool-calling and workflow automation
 - Retrieval-Augmented Generation (RAG)
-- Calendar scheduling
-- Production-grade security practices
+- Native calendar scheduling
+- Production-grade security and state management
 
 ---
 
 ## ✨ Features
 
-### ⚡ Ultra-Low Latency Voice Conversations
+- ⚡ **Ultra-Low Latency Voice**  
+  Powered by Groq's high-speed LPU inference engine. Streams responses in real time for natural, interruptible conversations.
 
-- Powered by Groq's high-speed inference engine.
-- Streams responses in real time for natural conversations.
-- Optimized for minimal response delay.
+- 🛠️ **Intelligent Tool Calling**  
+  Uses structured tool execution instead of relying on LLM hallucinations. Collects required information through conversational slot-filling.
 
-### 🛠️ Intelligent Tool Calling
+- 🧠 **Semantic RAG**  
+  Stores portfolio, project, and experience data in Pinecone. Uses Google Gemini embeddings for semantic search, dynamically gated to reduce latency.
 
-- Uses structured tool execution instead of relying on LLM hallucinations.
-- Collects required information through slot-filling.
-- Books interviews directly through Cal.com APIs.
+- 📅 **Automated Scheduling**  
+  Integrates directly with Cal.com v2 API. Checks live availability and provisions real meetings autonomously.
 
-### 🧠 Retrieval-Augmented Generation (RAG)
+- 🔒 **Production-Grade Security**  
+  Hidden backend endpoints, secure webhook routing, and isolated API key handling through a proxy architecture.
 
-- Stores portfolio, project, and experience data in Pinecone.
-- Uses Google Gemini embeddings for semantic search.
-- Dynamically enables RAG only when relevant to reduce latency.
-
-### 📅 Automated Interview Scheduling
-
-- Integrates with Cal.com v2.
-- Checks availability and creates real meetings automatically.
-- Handles scheduling workflows through agent reasoning.
-
-### 🔒 Production-Grade Security
-
-- Hidden backend endpoints.
-- Secret webhook routing.
-- Secure API key handling through backend proxy architecture.
-
-### 📊 Structured Observability
-
-- Centralized logging using Loguru.
-- Clear tracing of tool execution and API interactions.
-- Easier debugging and monitoring.
+- 📊 **Structured Observability**  
+  Centralized logging using Loguru for clear tracing of tool execution, RAG hits, and API interactions.
 
 ---
 
 ## 🏗️ Tech Stack
 
-| Layer           | Technology       |
-| --------------- | ---------------- |
-| Voice Platform  | Vapi + Cartesia  |
-| LLM             | Groq (Llama 3.1) |
-| Backend         | FastAPI          |
-| Frontend        | Next.js 14       |
-| Vector Database | Pinecone         |
-| Embeddings      | Google Gemini    |
-| Scheduling      | Cal.com v2       |
-| Logging         | Loguru           |
-| HTTP Client     | HTTPX            |
+| Layer               | Technology                  |
+| ------------------- | --------------------------- |
+| **Voice Platform**  | Vapi + Cartesia             |
+| **LLM Engine**      | Groq (Llama 3.1 8B Instant) |
+| **Backend**         | Python, FastAPI, `uv`       |
+| **Frontend**        | React, Next.js 14           |
+| **Vector Database** | Pinecone                    |
+| **Embeddings**      | Google Gemini               |
+| **Scheduling**      | Cal.com v2 REST API         |
+| **Observability**   | Loguru, HTTPX               |
 
 ---
 
@@ -111,7 +82,6 @@ Built as a technical demonstration for an AI Engineer role, the system showcases
 │   │   └── page.tsx
 │   └── package.json
 │
-├── .gitignore
 └── README.md
 ```
 
@@ -119,59 +89,49 @@ Built as a technical demonstration for an AI Engineer role, the system showcases
 
 ## ⚙️ Local Development
 
-### 1. Clone Repository
+### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/voice-ai-interview-agent.git
-
-cd voice-ai-interview-agent
+git clone https://github.com/yawar-abass/persona.git
+cd persona
 ```
 
-### 2. Backend Setup
+### 2. Backend Setup (Using `uv`)
+
+This project uses `uv`, an extremely fast Python package installer and dependency resolver.
 
 ```bash
 cd backend
+uv sync
 
-python -m venv .venv
-
-# Linux / macOS
-source .venv/bin/activate
-
-# Windows
-.venv\Scripts\activate
-
-pip install -r requirements.txt
 ```
 
 ### 3. Frontend Setup
 
 ```bash
-cd ../frontend
-
+cd frontend
 npm install
 ```
 
----
+### 4. Environment Variables
 
-## 🔑 Environment Variables
-
-Create a `.env` file and configure the following values:
+Create a `.env` file inside the `backend` directory:
 
 ```env
 # LLM & AI Services
-GROQ_API_KEY=
-GEMINI_API_KEY=
+GROQ_API_KEY=your_groq_key
+GEMINI_API_KEY=your_gemini_key
 
 # Vector Database
-PINECONE_API_KEY=
-PINECONE_INDEX_NAME=
+PINECONE_API_KEY=your_pinecone_key
+PINECONE_INDEX_NAME=your_index_name
 
-# Calendar Integration
-CAL_API_KEY=
-CAL_EVENT_TYPE_ID=
+# Calendar Integration (Cal.com v2)
+CAL_API_KEY=your_cal_api_key
+CAL_EVENT_TYPE_ID=your_event_id
 
 # Security
-VAPI_SECRET=
+VAPI_SECRET=your_secure_webhook_route
 ```
 
 ---
@@ -182,79 +142,50 @@ VAPI_SECRET=
 
 ```bash
 cd backend
+uv run fastapi dev
+```
 
-uvicorn app.main:app --reload --port 8000
+Backend runs at:
+
+```text
+http://localhost:8000
 ```
 
 ### Start Frontend
 
 ```bash
 cd frontend
-
 npm run dev
 ```
 
-Application URLs:
+Frontend runs at:
 
 ```text
-Frontend: http://localhost:3000
-Backend:  http://localhost:8000
+http://localhost:3000
 ```
 
 ---
-
-## ☁️ Deployment
-
-This architecture is optimized for deployment on persistent servers that support long-lived streaming connections.
-
-### Recommended Platforms
-
-- Render
-- Fly.io
-- AWS EC2
-- DigitalOcean
-
-### Deployment Steps
-
-1. Deploy the `backend` directory as a Python web service.
-2. Configure all environment variables.
-3. Deploy the `frontend` directory as a Next.js application.
-4. Update your Vapi Custom LLM endpoint to point to the production backend URL.
-5. Keep backend endpoints protected using the configured secret route.
-
-### Performance Recommendation
-
-Deploy infrastructure in **US-East** or **US-West** regions to minimize latency with Groq and Vapi services.
-
----
-
-## 🎯 Key Engineering Highlights
-
-- Real-time voice AI orchestration
-- Async FastAPI architecture
-- Streaming response generation
-- Agentic tool execution
-- Production-grade RAG implementation
-- Calendar workflow automation
-- Secure Backend-for-Frontend design
-- Low-latency optimization techniques
 
 ---
 
 ## 👨‍💻 Author
 
-**Yawar Abass**
+### Yawar Abass
 
-Frontend Developer • AI Enthusiast • AI Engineer Candidate
+**Full-Stack Developer • AI Enthusiast • AI Engineer Candidate**
 
 Built to demonstrate practical applications of:
 
 - Agentic AI Systems
-- Voice Interfaces
-- RAG Architectures
-- Tool Calling Workflows
+- Retrieval-Augmented Generation (RAG)
 - Production AI Engineering
+- Voice AI Workflows
+- Tool-Calling Architectures
 
 ---
 
-⭐ If you found this project interesting, consider giving it a star.
+## ⭐ Support
+
+If you found this project useful or interesting, consider giving it a **star** on GitHub.
+
+Your support helps showcase the project and motivates future improvements.
