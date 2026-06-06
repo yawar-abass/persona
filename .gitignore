@@ -1,0 +1,88 @@
+# ==========================================
+# SECRETS & ENVIRONMENT VARIABLES
+# ==========================================
+# Catch .env files anywhere in the monorepo, but allow templates
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+
+# ==========================================
+# OPERATING SYSTEM & LOGS
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.log
+
+# ==========================================
+# IDEs & EDITORS
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.iws
+*.iml
+*.swp
+
+# ==========================================
+# 🐍 BACKEND (PYTHON / FASTAPI)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments (Catches venvs inside the backend folder)
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & Linting Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# Python Build / Distribution
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+
+# ==========================================
+# ⚛️ FRONTEND (NEXT.JS / NODE.JS)
+# ==========================================
+# Dependencies (Catches node_modules inside the frontend folder)
+node_modules/
+
+# Next.js Build Outputs
+.next/
+out/
+build/
+.vercel/
+
+# Package Manager Caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store
+.yarn/install-state.gz
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
