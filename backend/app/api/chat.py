@@ -8,7 +8,7 @@ from app.core.persona import SYSTEM_PROMPT
 from app.core.security import clean_and_validate_input
 from app.services.rag_service import rag_service
 from app.services.cal_service import cal_service
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from loguru import logger
 import re
@@ -109,20 +109,36 @@ async def chat_completions(request: Request):
             break
 
     # 3. Sliding Window Context
-    MAX_HISTORY = 10
+    MAX_HISTORY = 12
     if len(clean_messages) > MAX_HISTORY:
-        clean_messages = clean_messages[-MAX_HISTORY:]
-        while clean_messages and clean_messages[0].get("role") == "tool":
-            clean_messages.pop(0)
-        while clean_messages and "tool_calls" in clean_messages[0]:
-            clean_messages.pop(0)
+        # Slice from the end to keep the most recent messages
+        cutoff_index = len(clean_messages) - MAX_HISTORY
+        sliced_messages = clean_messages[cutoff_index:]
+        
+        # it has lost its parent "assistant" trigger. It is orphaned. Remove it.
+        while sliced_messages and sliced_messages[0].get("role") == "tool":
+            sliced_messages.pop(0)
+            
+        # that tried to call a tool, but we just deleted the tool response, remove the trigger too.
+        while sliced_messages and (sliced_messages[0].get("role") == "assistant" and "tool_calls" in sliced_messages[0]):
+            sliced_messages.pop(0)
+            
+        clean_messages = sliced_messages
 
     # 4. Latency Guard (Keyword RAG)
     rag_context = ""
-    keywords = ["project", "experience", "iit", "collabnotes", "tech", "stack", "architecture", "kotlin", "android", "ai", "ml", "research", "education", "background", "skills"]
-    if any(word in safe_query.lower() for word in keywords) and len(safe_query.split()) > 2:
-        logger.debug(f"🔍 Running RAG for: {safe_query}")
-        rag_context = rag_service.retrieve_context(safe_query)
+
+    normalized_query = safe_query.lower().strip()
+
+    import string
+    clean_normalized = normalized_query.translate(str.maketrans('', '', string.punctuation))
+
+    filler_phrases = {"hello", "hi", "hey", "yes", "no", "yeah", "nope", "okay", "ok", "thanks", "thank you", "cool", "got it", "awesome", "sure", "right"}
+
+    if clean_normalized and clean_normalized not in filler_phrases:
+        logger.debug(f"🔍 Running Semantic RAG for: {safe_query}")
+        # Bumping top_k to 4 to ensure we catch deep README details
+        rag_context = rag_service.retrieve_context(safe_query, top_k=4)
 
     # 5. Build Context
     current_system_prompt = SYSTEM_PROMPT
@@ -187,7 +203,15 @@ async def chat_completions(request: Request):
                 if delta.tool_calls:
                     is_tool_call = True
                     if not has_yielded_filler:
-                        yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Got it. Let me check the calendar right now...'}}]})}\n\n"
+                        # 1. Voice Fallback: Yield the filler phrase for the audio stream
+                        yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Give me just a second...'}}]})}\n\n"
+                        
+                        # 2. UI Signal: Yield a custom tool-pending state for your web chat
+                        ui_signal = {
+                            "id": "tool-exec",
+                            "choices": [{"delta": {"tool_calls": [{"function": {"name": "system_action", "arguments": "{}"}}]}}]
+                        }
+                        yield f"data: {json.dumps(ui_signal)}\n\n"
                         has_yielded_filler = True
 
                     for tc in delta.tool_calls:
@@ -219,10 +243,19 @@ async def chat_completions(request: Request):
 
                         raw_email = arguments.get("email", "")
                         raw_name = arguments.get("name", "").strip()
-                        start_time = arguments.get("start_time", "").strip()
+                        raw_start_time = arguments.get("start_time", "").strip()
 
                         email_data = sanitize_and_validate_email(raw_email)
-                        
+                        current_dt = datetime.now(ist_tz)
+                        if "tomorrow" in raw_start_time.lower():
+                            target_dt = current_dt + timedelta(days=1)
+                            # Default to 10:00 AM if no specific time was caught
+                            start_time = target_dt.replace(hour=10, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        elif "today" in raw_start_time.lower():
+                            start_time = current_dt.replace(hour=17, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        else:
+                            # Assume the LLM formatted it correctly, but ensure 'Z' UTC compliance for Cal.com
+                            start_time = raw_start_time if raw_start_time.endswith("Z") else f"{raw_start_time}Z"
                         validation_errors = []
                         if not raw_name or len(raw_name) < 2:
                             validation_errors.append("a valid full name")
