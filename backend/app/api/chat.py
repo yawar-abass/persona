@@ -72,6 +72,12 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
         
     clean_email = spoken_email.lower().strip()
     
+    # --- NEW: Strip conversational prefixes before parsing ---
+    prefixes = ["it is ", "its ", "it's ", "my email is ", "email is ", "that is ", "that's "]
+    for prefix in prefixes:
+        if clean_email.startswith(prefix):
+            clean_email = clean_email[len(prefix):].strip()
+            
     # 1. Expand common voice-to-text spelled elements (Added underscore/dash)
     replacements = {
         " at rate ": "@",
@@ -87,6 +93,7 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
         " double u ": "w",
         " at sign ": "@"
     }
+    # ... (Keep the rest of your sanitizer logic exactly the same from here down)
     for old, new in replacements.items():
         clean_email = clean_email.replace(old, new)
         
@@ -210,11 +217,11 @@ async def chat_completions(request: Request):
     async def unified_streaming_generator():
         try:
             stream_response = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 messages=final_messages,
                 tools=[BOOKING_TOOL],
                 tool_choice="auto",
-                temperature=0.2,
+                temperature=0.1,
                 stream=True
             )
 
@@ -341,7 +348,7 @@ async def chat_completions(request: Request):
 
                 # Stream the final post-tool result
                 tool_result_stream = groq_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
+                    model="llama-3.3-70b-versatile",
                     messages=final_messages,
                     temperature=0.3,
                     stream=True
