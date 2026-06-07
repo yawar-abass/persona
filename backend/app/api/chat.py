@@ -1,17 +1,18 @@
 import json
-from fastapi import APIRouter, Request, HTTPException
+import re
+import asyncio
+from datetime import datetime
+import pytz
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from groq import Groq
+from groq import Groq, RateLimitError
+from loguru import logger
+
 from app.config import settings
 from app.core.persona import SYSTEM_PROMPT
 from app.core.security import clean_and_validate_input
 from app.services.rag_service import rag_service
 from app.services.cal_service import cal_service
-from datetime import datetime, timedelta
-import pytz
-from loguru import logger
-import re
-
 
 router = APIRouter()
 groq_client = Groq(api_key=settings.GROQ_API_KEY)
@@ -30,8 +31,8 @@ BOOKING_TOOL = {
                     "description": "The full name of the recruiter, interviewer, or evaluator."
                 },
                 "email": {
-                "type": "string",
-                 "description": "The valid email address of the attendee. CRITICAL FOR VOICE: You must aggressively clean phonetic spellings before outputting. Remove all spaces between spelled letters. Convert 'underscore' to '_', 'dash' to '-', 'at' to '@', and 'dot' to '.'. Example: 'j o h n underscore d o e at g mail dot com' -> 'john_doe@gmail.com'."
+                    "type": "string",
+                    "description": "The valid email address of the attendee. CRITICAL FOR VOICE: You must aggressively clean phonetic spellings before outputting. Remove all spaces between spelled letters. Convert 'underscore' to '_', 'dash' to '-', 'at' to '@', and 'dot' to '.'. Example: 'j o h n underscore d o e at g mail dot com' -> 'john_doe@gmail.com'."
                 },
                 "start_time": {
                     "type": "string",
@@ -43,26 +44,6 @@ BOOKING_TOOL = {
     }
 }
 
-
-CHECK_AVAILABILITY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "check_calendar_availability",
-        "description": "Checks the user's real calendar for open, available time slots on a specific date. Use this BEFORE attempting to book a meeting so you can propose real times to the caller.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {
-                    "type": "string",
-                    "description": "The exact date to check for open slots in YYYY-MM-DD format (e.g., '2026-06-15'). Ensure the year is 2026."
-                }
-            },
-            "required": ["date"]
-        }
-    }
-}
-
-
 SECRET_ROUTE = settings.VAPI_SECRET
 
 def sanitize_and_validate_email(spoken_email: str) -> dict:
@@ -72,32 +53,23 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
         
     clean_email = spoken_email.lower().strip()
     
-    # --- NEW: Strip conversational prefixes before parsing ---
+    # 1. Strip conversational prefixes before parsing
     prefixes = ["it is ", "its ", "it's ", "my email is ", "email is ", "that is ", "that's "]
     for prefix in prefixes:
         if clean_email.startswith(prefix):
             clean_email = clean_email[len(prefix):].strip()
             
-    # 1. Expand common voice-to-text spelled elements (Added underscore/dash)
+    # 2. Expand common voice-to-text spelled elements
     replacements = {
-        " at rate ": "@",
-        " at ": "@",
-        " [at] ": "@",
-        "(at)": "@",
-        " dot ": ".",
-        " [dot] ": ".",
-        "(dot)": ".",
-        " underscore ": "_",
-        " dash ": "-",
-        " hyphen ": "-",
-        " double u ": "w",
-        " at sign ": "@"
+        " at rate ": "@", " at ": "@", " [at] ": "@", "(at)": "@", " at sign ": "@",
+        " dot ": ".", " [dot] ": ".", "(dot)": ".",
+        " underscore ": "_", " dash ": "-", " hyphen ": "-",
+        " double u ": "w"
     }
-    # ... (Keep the rest of your sanitizer logic exactly the same from here down)
     for old, new in replacements.items():
         clean_email = clean_email.replace(old, new)
         
-    # 2. Convert spelled-out numbers to digits
+    # 3. Convert spelled-out numbers to digits
     number_words = {
         "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", 
         "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
@@ -105,17 +77,17 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
     for word, digit in number_words.items():
         clean_email = re.sub(rf'\b{word}\b', digit, clean_email)
         
-    # 3. Strip ALL spaces (Fixes "y e w a r @ g mail . com")
+    # 4. Strip ALL spaces (Fixes "y e w a r @ g mail . com")
     clean_email = clean_email.replace(" ", "")
     
-    # 4. Clean up Transcriber Stuttering & duplicate domains
-    clean_email = re.sub(r'@+', '@', clean_email)  # Collapse multiple @@@ into one @
-    clean_email = re.sub(r'\.+', '.', clean_email)  # Collapse multiple ... into one .
+    # 5. Clean up Transcriber Stuttering & duplicate domains
+    clean_email = re.sub(r'@+', '@', clean_email)
+    clean_email = re.sub(r'\.+', '.', clean_email)
     clean_email = clean_email.replace("gmailgmail", "gmail")
     clean_email = clean_email.replace("yahooyahoo", "yahoo")
     clean_email = clean_email.replace("outlookoutlook", "outlook")
     
-    # 5. Fix common fragmented domains caused by STT spacing
+    # 6. Fix common fragmented domains caused by STT spacing
     domain_fixes = {
         "@gmai.": "@gmail.",
         "@g.mail.": "@gmail.",
@@ -124,10 +96,10 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
     for bad_domain, good_domain in domain_fixes.items():
         clean_email = clean_email.replace(bad_domain, good_domain)
         
-    # 6. Strip trailing periods (often added by STT at the end of a sentence)
+    # 7. Strip trailing periods
     clean_email = clean_email.rstrip('.')
     
-    # 7. Final Regex validation
+    # 8. Final Regex validation
     email_regex = r"^[\w\.-]+@[\w\.-]+\.\w+$"
     is_valid = bool(re.match(email_regex, clean_email))
     
@@ -161,28 +133,24 @@ async def chat_completions(request: Request):
                 clean_messages[i]["content"] = safe_query
             break
 
-    # 3. PRODUCTION FIX: Sliding Window Context
+    # 3. PRODUCTION FIX: Sliding Window Context (Atomic Tool Slicing)
     MAX_HISTORY = 10
     if len(clean_messages) > MAX_HISTORY:
-        # Slice from the end to keep the most recent messages
         cutoff_index = len(clean_messages) - MAX_HISTORY
         sliced_messages = clean_messages[cutoff_index:]
         
-        # it has lost its parent "assistant" trigger. It is orphaned. Remove it.
         while sliced_messages and sliced_messages[0].get("role") == "tool":
             sliced_messages.pop(0)
             
-        # that tried to call a tool, but we just deleted the tool response, remove the trigger too.
         while sliced_messages and (sliced_messages[0].get("role") == "assistant" and "tool_calls" in sliced_messages[0]):
             sliced_messages.pop(0)
             
         clean_messages = sliced_messages
 
-   # 4. Latency Guard (Semantic RAG with State Awareness)
+    # 4. Latency Guard (Semantic RAG with State Awareness)
     rag_context = ""
     normalized_query = safe_query.lower().strip()
     
-    # Check if the assistant just asked for an email
     last_assistant_msg = ""
     for i in range(len(clean_messages) - 1, -1, -1):
         if clean_messages[i].get("role") == "assistant":
@@ -190,17 +158,14 @@ async def chat_completions(request: Request):
             break
             
     is_email_collection = "email" in last_assistant_msg or "address" in last_assistant_msg
-    
-    # New: Broadened filler logic
     word_count = len(normalized_query.split())
     conversational_triggers = ["hello", "hi", "hey", "yes", "no", "yeah", "nope", "okay", "ok", "thanks", "sure", "done", "how are you"]
-    
-    # It's filler if it's very short (under 6 words) AND contains a conversational trigger
     is_filler = word_count < 6 and any(word in normalized_query for word in conversational_triggers)
 
     if normalized_query and not is_email_collection and not is_filler:
         logger.debug(f"🔍 Running Semantic RAG for: {safe_query}")
         rag_context = rag_service.retrieve_context(safe_query, top_k=4)
+
     # 5. Build Context
     current_system_prompt = SYSTEM_PROMPT
     if rag_context:
@@ -215,21 +180,46 @@ async def chat_completions(request: Request):
 
     # 6. THE UNIFIED STREAMING GENERATOR
     async def unified_streaming_generator():
-        try:
-            stream_response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=final_messages,
-                tools=[BOOKING_TOOL],
-                tool_choice="auto",
-                temperature=0.1,
-                stream=True
-            )
+        stream_response = None
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                stream_response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=final_messages,
+                    tools=[BOOKING_TOOL],
+                    tool_choice="auto",
+                    temperature=0.1,
+                    stream=True
+                )
+                break
+            except RateLimitError:
+                if attempt < max_retries - 1:
+                    try:
+                        yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Still checking, give me one second...'}}]})}\n\n"
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.5)
+                else:
+                    try:
+                        yield f"data: {json.dumps({'id': 'err', 'choices': [{'delta': {'content': 'My systems are overwhelmed with traffic. Could we try again?'}}]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception:
+                        pass
+                    return
+            except Exception as e:
+                logger.error(f"🚨 Initialization Error: {e}")
+                return
 
+        if not stream_response:
+            return
+
+        try:
             tool_calls_accumulators = {}
             is_tool_call = False
             has_yielded_filler = False
 
-            # Iterate through the chunks as they arrive in milliseconds
             for chunk in stream_response:
                 delta = chunk.choices[0].delta
 
@@ -237,35 +227,30 @@ async def chat_completions(request: Request):
                 if delta.tool_calls:
                     is_tool_call = True
                     
-                    # IMMEDIATELY yield the filler phrase to satisfy Vapi's timeout
                     if not has_yielded_filler:
                         try:
-                            # Yield ONLY standard text content so Vapi can speak it. 
-                            # Do NOT yield fake tool_calls, it crashes the Vapi parser.
-                            yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Give me just a second to pull that up...'}}]})}\n\n"
+                            yield f"data: {json.dumps({'id': 'filler', 'choices': [{'delta': {'content': 'Let me check that real quick...'}}]})}\n\n"
                         except Exception:
-                            break # Handle user interruption gracefully
+                            break 
                         has_yielded_filler = True
 
                     for tc in delta.tool_calls:
                         index = tc.index
                         if index not in tool_calls_accumulators:
-                            tool_calls_accumulators[index] = {
-                                "id": tc.id,
-                                "name": tc.function.name if tc.function else "book_calendar_interview",
-                                "arguments": ""
-                            }
+                            tool_calls_accumulators[index] = {"id": tc.id, "name": tc.function.name if tc.function else "book_calendar_interview", "arguments": ""}
                         if tc.function and tc.function.arguments:
                             tool_calls_accumulators[index]["arguments"] += tc.function.arguments
                     continue 
 
                 # --- PATH B: GROQ IS JUST TALKING (Instant Stream) ---
                 if delta.content and not is_tool_call:
-                    yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': delta.content}}]})}\n\n"
+                    try:
+                        yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': delta.content}}]})}\n\n"
+                    except Exception:
+                        break
 
             # --- EXECUTE THE TOOL (Only triggers if Path A happened) ---
             if is_tool_call:
-                # Reconstruct the tool call object
                 formatted_tool_calls = []
                 for tc in tool_calls_accumulators.values():
                     formatted_tool_calls.append({
@@ -276,7 +261,6 @@ async def chat_completions(request: Request):
 
                 final_messages.append({"role": "assistant", "tool_calls": formatted_tool_calls})
 
-                # Execute with The Bouncer
                 for tc in formatted_tool_calls:
                     if tc["function"]["name"] == "book_calendar_interview":
                         try:
@@ -289,30 +273,18 @@ async def chat_completions(request: Request):
                         raw_start_time = arguments.get("start_time", "").strip()
 
                         email_data = sanitize_and_validate_email(raw_email)
-                        current_dt = datetime.now(ist_tz)
                         start_time = ""
 
-                        if "tomorrow" in raw_start_time.lower():
-                            target_dt = current_dt + timedelta(days=1)
-                            start_time = target_dt.replace(hour=10, minute=0, second=0).astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        elif "today" in raw_start_time.lower():
-                            start_time = current_dt.replace(hour=17, minute=0, second=0).astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        else:
-                            iso_pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-                            match = re.search(iso_pattern, raw_start_time)
-                            
-                            if match:
-                                # 1. Parse the string as a naive datetime object
-                                naive_dt = datetime.strptime(match.group(0), "%Y-%m-%dT%H:%M:%S")
-                                # 2. Force it to be understood as IST (since the user/AI speak in IST)
+                        # --- BULLETPROOF DATE PARSING ---
+                        if raw_start_time:
+                            try:
+                                # Normalize string, swap 'T' for space and grab only the first 19 chars
+                                clean_time_string = raw_start_time.replace("T", " ")[:19]
+                                naive_dt = datetime.strptime(clean_time_string, "%Y-%m-%d %H:%M:%S")
                                 local_dt = ist_tz.localize(naive_dt)
-                                # 3. Convert safely to UTC for Cal.com
-                                utc_dt = local_dt.astimezone(pytz.utc)
-                                start_time = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                            else:
-                                logger.error(f"❌ Unparseable ISO string from LLM: {raw_start_time}")
-                                start_time = ""
-
+                                start_time = local_dt.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except Exception as e:
+                                logger.error(f"❌ Unparseable time string from LLM: {raw_start_time}. Error: {e}")
 
                         validation_errors = []
                         if not raw_name or len(raw_name) < 2:
@@ -355,13 +327,22 @@ async def chat_completions(request: Request):
                 )
                 for chunk in tool_result_stream:
                     if chunk.choices[0].delta.content is not None:
-                        yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': chunk.choices[0].delta.content}}]})}\n\n"
+                        try:
+                            yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': chunk.choices[0].delta.content}}]})}\n\n"
+                        except Exception:
+                            break
 
-            yield "data: [DONE]\n\n"
+            try:
+                yield "data: [DONE]\n\n"
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"🚨 Stream Error: {e}")
-            yield f"data: {json.dumps({'id': 'err', 'choices': [{'delta': {'content': 'My apologies, I had a brief connection issue. Could you repeat that?'}}]})}\n\n"
-            yield "data: [DONE]\n\n"
+            try:
+                yield f"data: {json.dumps({'id': 'err', 'choices': [{'delta': {'content': 'My apologies, I had a brief connection issue. Could you repeat that?'}}]})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception:
+                pass
 
     return StreamingResponse(unified_streaming_generator(), media_type="text/event-stream")
