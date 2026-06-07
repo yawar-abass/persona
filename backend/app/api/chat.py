@@ -171,23 +171,29 @@ async def chat_completions(request: Request):
             
         clean_messages = sliced_messages
 
-    # 4. Latency Guard (Keyword RAG)
+   # 4. Latency Guard (Semantic RAG with State Awareness)
     rag_context = ""
-
     normalized_query = safe_query.lower().strip()
+    
+    # Check if the assistant just asked for an email
+    last_assistant_msg = ""
+    for i in range(len(clean_messages) - 1, -1, -1):
+        if clean_messages[i].get("role") == "assistant":
+            last_assistant_msg = clean_messages[i].get("content", "").lower()
+            break
+            
+    is_email_collection = "email" in last_assistant_msg or "address" in last_assistant_msg
+    
+    # New: Broadened filler logic
+    word_count = len(normalized_query.split())
+    conversational_triggers = ["hello", "hi", "hey", "yes", "no", "yeah", "nope", "okay", "ok", "thanks", "sure", "done", "how are you"]
+    
+    # It's filler if it's very short (under 6 words) AND contains a conversational trigger
+    is_filler = word_count < 6 and any(word in normalized_query for word in conversational_triggers)
 
-    import string
-    clean_normalized = normalized_query.translate(str.maketrans('', '', string.punctuation))
-
-    filler_phrases = {"hello", "hi", "hey", "yes", "no", "yeah", "nope", "okay", "ok", "thanks", "thank you", "cool", "got it", "awesome", "sure", "right"}
-
-    is_personal_info = any(indicator in normalized_query for indicator in ["@", "dot com", "gmail", "yahoo", "my name is", "i am", "email"])
-
-    if clean_normalized and clean_normalized not in filler_phrases and not is_personal_info:
+    if normalized_query and not is_email_collection and not is_filler:
         logger.debug(f"🔍 Running Semantic RAG for: {safe_query}")
-        # Bumping top_k to 4 to ensure we catch deep README details
         rag_context = rag_service.retrieve_context(safe_query, top_k=4)
-
     # 5. Build Context
     current_system_prompt = SYSTEM_PROMPT
     if rag_context:
@@ -279,23 +285,24 @@ async def chat_completions(request: Request):
                         current_dt = datetime.now(ist_tz)
                         start_time = ""
 
-                        # --- BULLETPROOF DATE PARSING ---
                         if "tomorrow" in raw_start_time.lower():
                             target_dt = current_dt + timedelta(days=1)
-                            start_time = target_dt.replace(hour=10, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            start_time = target_dt.replace(hour=10, minute=0, second=0).astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                         elif "today" in raw_start_time.lower():
-                            start_time = current_dt.replace(hour=17, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            start_time = current_dt.replace(hour=17, minute=0, second=0).astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                         else:
-                            # Use Regex to extract exactly YYYY-MM-DDTHH:MM:SS, ignoring any trailing garbage
                             iso_pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
                             match = re.search(iso_pattern, raw_start_time)
                             
                             if match:
-                                # Force the 'Z' on the cleanly extracted string
-                                start_time = f"{match.group(0)}Z"
+                                # 1. Parse the string as a naive datetime object
+                                naive_dt = datetime.strptime(match.group(0), "%Y-%m-%dT%H:%M:%S")
+                                # 2. Force it to be understood as IST (since the user/AI speak in IST)
+                                local_dt = ist_tz.localize(naive_dt)
+                                # 3. Convert safely to UTC for Cal.com
+                                utc_dt = local_dt.astimezone(pytz.utc)
+                                start_time = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                             else:
-                                # If the LLM passed something completely unreadable (e.g., "10 AM"), 
-                                # leave start_time empty so the validation block catches it.
                                 logger.error(f"❌ Unparseable ISO string from LLM: {raw_start_time}")
                                 start_time = ""
 
