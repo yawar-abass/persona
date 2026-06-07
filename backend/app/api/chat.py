@@ -30,8 +30,8 @@ BOOKING_TOOL = {
                     "description": "The full name of the recruiter, interviewer, or evaluator."
                 },
                 "email": {
-                    "type": "string",
-                    "description": "The valid email address of the attendee where the calendar invite will be sent."
+                "type": "string",
+                 "description": "The valid email address of the attendee. CRITICAL FOR VOICE: You must aggressively clean phonetic spellings before outputting. Remove all spaces between spelled letters. Convert 'underscore' to '_', 'dash' to '-', 'at' to '@', and 'dot' to '.'. Example: 'j o h n underscore d o e at g mail dot com' -> 'john_doe@gmail.com'."
                 },
                 "start_time": {
                     "type": "string",
@@ -72,16 +72,7 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
         
     clean_email = spoken_email.lower().strip()
     
-    # 1. Convert spelled-out numbers to digits
-    number_words = {
-        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", 
-        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
-    }
-    for word, digit in number_words.items():
-        # Use regex to only replace whole words (so we don't accidentally replace 't' in 'two')
-        clean_email = re.sub(rf'\b{word}\b', digit, clean_email)
-        
-    # 2. Text to symbol replacements
+    # 1. Expand common voice-to-text spelled elements (Added underscore/dash)
     replacements = {
         " at rate ": "@",
         " at ": "@",
@@ -90,23 +81,46 @@ def sanitize_and_validate_email(spoken_email: str) -> dict:
         " dot ": ".",
         " [dot] ": ".",
         "(dot)": ".",
+        " underscore ": "_",
+        " dash ": "-",
+        " hyphen ": "-",
+        " double u ": "w",
+        " at sign ": "@"
     }
     for old, new in replacements.items():
         clean_email = clean_email.replace(old, new)
         
-    # 3. Strip all spaces
+    # 2. Convert spelled-out numbers to digits
+    number_words = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", 
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+    }
+    for word, digit in number_words.items():
+        clean_email = re.sub(rf'\b{word}\b', digit, clean_email)
+        
+    # 3. Strip ALL spaces (Fixes "y e w a r @ g mail . com")
     clean_email = clean_email.replace(" ", "")
     
-    # 4. Clean up Transcriber Stuttering (The "at at" and "gmail gmail" problem)
+    # 4. Clean up Transcriber Stuttering & duplicate domains
     clean_email = re.sub(r'@+', '@', clean_email)  # Collapse multiple @@@ into one @
     clean_email = re.sub(r'\.+', '.', clean_email)  # Collapse multiple ... into one .
     clean_email = clean_email.replace("gmailgmail", "gmail")
     clean_email = clean_email.replace("yahooyahoo", "yahoo")
+    clean_email = clean_email.replace("outlookoutlook", "outlook")
     
-    # 5. Strip trailing periods (added by transcriber at the end of sentences)
+    # 5. Fix common fragmented domains caused by STT spacing
+    domain_fixes = {
+        "@gmai.": "@gmail.",
+        "@g.mail.": "@gmail.",
+        "@yaho.": "@yahoo.",
+    }
+    for bad_domain, good_domain in domain_fixes.items():
+        clean_email = clean_email.replace(bad_domain, good_domain)
+        
+    # 6. Strip trailing periods (often added by STT at the end of a sentence)
     clean_email = clean_email.rstrip('.')
     
-    # 6. Regex validation
+    # 7. Final Regex validation
     email_regex = r"^[\w\.-]+@[\w\.-]+\.\w+$"
     is_valid = bool(re.match(email_regex, clean_email))
     
@@ -297,7 +311,11 @@ async def chat_completions(request: Request):
                         if validation_errors:
                             logger.warning(f"⚠️ Validation Failed: {validation_errors}. Raw Email: {raw_email}")
                             issues_str = " and ".join(validation_errors)
-                            error_prompt = f"SYSTEM ERROR: You cannot book yet. The provided data is invalid. Politely ask the user to clarify: {issues_str}. Note: The email you heard was '{raw_email}' which is invalid."
+                            
+                            if not email_data["is_valid"] and email_data["clean_email"]:
+                                error_prompt = f"SYSTEM ERROR: The email I heard was '{email_data['clean_email']}', but it seems to be missing something. Could you spell it out for me one more time?"
+                            else:
+                                error_prompt = f"SYSTEM ERROR: You cannot book yet. The provided data is invalid. Politely ask the user to clarify: {issues_str}."
                             
                             booking_result = {"success": False, "message": error_prompt}
                         else:
