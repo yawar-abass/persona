@@ -35,7 +35,7 @@ BOOKING_TOOL = {
                 },
                 "start_time": {
                     "type": "string",
-                    "description": "The exact ISO 8601 UTC date-time string for the slot (e.g., '2026-06-15T10:00:00Z'). Ensure the year matches 2026."
+                    "description": "The exact date and time for the meeting in IST formatted as 'YYYY-MM-DD HH:MM:SS' (e.g., '2026-06-08 13:00:00' for 1 PM). Do NOT convert to UTC."
                 }
             },
             "required": ["name", "email", "start_time"]
